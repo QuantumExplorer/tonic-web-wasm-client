@@ -101,7 +101,7 @@ impl ReadState {
     /// `TrailerLength` and `Trailer(_)` must not count: in those states the
     /// trailers frame has started but more bytes are still needed from the
     /// stream, which happens whenever a chunk boundary lands inside it.
-    fn finished_data(&self) -> bool {
+    fn is_done(&self) -> bool {
         matches!(self, ReadState::Done)
     }
 }
@@ -238,6 +238,10 @@ impl ResponseBody {
                         let mut trailer_bytes = this.buf.take(trailer_length);
                         trailer_bytes.put_u8(b'\n');
 
+                        // The trailers frame is consumed and is the last one, so the
+                        // body is over even if parsing it fails below.
+                        *this.state = ReadState::Done;
+
                         let mut trailers_buf = [EMPTY_HEADER; 64];
                         let parsed_trailers =
                             match httparse::parse_headers(&trailer_bytes, &mut trailers_buf)
@@ -257,8 +261,6 @@ impl ResponseBody {
                         }
 
                         *this.trailer = Some(trailers);
-
-                        *this.state = ReadState::Done;
                     }
                 }
                 ReadState::Done => return Ok(()),
@@ -283,8 +285,8 @@ impl Body for ResponseBody {
             return Poll::Ready(Some(Ok(http_body::Frame::data(data.freeze()))));
         }
 
-        // If reading data is finished, return trailers (if available) before ending
-        if self.state.finished_data() {
+        // If the whole body is read, return trailers (if available) before ending
+        if self.state.is_done() {
             if let Some(trailers) = self.trailer.take() {
                 return Poll::Ready(Some(Ok(http_body::Frame::trailers(trailers))));
             }
@@ -306,14 +308,14 @@ impl Body for ResponseBody {
                 // If data is available in buffer, return that
                 let data = self.data.take().unwrap();
                 return Poll::Ready(Some(Ok(http_body::Frame::data(data.freeze()))));
-            } else if self.state.finished_data() {
-                // If we finished reading data, return trailers before ending
+            } else if self.state.is_done() {
+                // If we finished reading the body, return trailers before ending
                 if let Some(trailers) = self.trailer.take() {
                     return Poll::Ready(Some(Ok(http_body::Frame::trailers(trailers))));
                 }
                 return Poll::Ready(None);
             } else if self.finished_stream {
-                // If stream is finished but data is not finished return error
+                // If stream is finished but the body is not, return error
                 return Poll::Ready(Some(Err(Error::MalformedResponse)));
             }
         }
@@ -340,82 +342,138 @@ impl Default for ResponseBody {
 
 #[cfg(test)]
 mod tests {
-    use futures_util::{stream, task::noop_waker};
+    use std::{collections::VecDeque, task::Waker};
+
+    use futures_util::stream;
 
     use super::*;
 
     const TRAILERS: &[u8] = b"grpc-status:0\r\ngrpc-message:\r\n";
 
+    /// Body fed from `chunks`. The stream returns `Pending` before every chunk,
+    /// as a fetch body does, so `poll_frame` is re-entered at each boundary.
     fn body_from_chunks(chunks: Vec<Bytes>) -> ResponseBody {
+        let mut chunks = VecDeque::from(chunks);
+        let mut pending = false;
+        let body_stream = stream::poll_fn(move |_| {
+            pending = !pending;
+            if pending {
+                Poll::Pending
+            } else {
+                Poll::Ready(chunks.pop_front().map(Ok))
+            }
+        });
+
         ResponseBody {
-            body_stream: BodyStream::from_stream(stream::iter(chunks.into_iter().map(Ok))),
+            body_stream: BodyStream::from_stream(body_stream),
             finished_stream: false,
             state: ReadState::CompressionFlag,
             ..Default::default()
         }
     }
 
-    /// A grpc-web response: one data frame followed by the trailers frame.
-    fn wire(message_len: usize) -> (Bytes, usize) {
+    /// A grpc-web response: one data frame per message length, followed by a
+    /// trailers frame. Returns the wire bytes and the length of the data frames.
+    fn wire(message_lens: &[usize], trailers: &[u8]) -> (Bytes, usize) {
         let mut wire = BytesMut::new();
-        wire.put_u8(0);
-        wire.put_u32(message_len as u32);
-        wire.put_bytes(0xAB, message_len);
-        let data_frame_len = wire.len();
+        for &message_len in message_lens {
+            wire.put_u8(0);
+            wire.put_u32(message_len as u32);
+            wire.extend((0..message_len).map(|i| i as u8));
+        }
+        let data_frames_len = wire.len();
         wire.put_u8(TRAILER_BIT);
-        wire.put_u32(TRAILERS.len() as u32);
-        wire.put_slice(TRAILERS);
-        (wire.freeze(), data_frame_len)
+        wire.put_u32(trailers.len() as u32);
+        wire.put_slice(trailers);
+        (wire.freeze(), data_frames_len)
     }
 
-    /// Drains the body, returning the number of data bytes and the trailers.
-    fn drain(mut body: ResponseBody) -> Result<(usize, Option<HeaderMap>), Error> {
-        let waker = noop_waker();
-        let mut cx = Context::from_waker(&waker);
-        let mut body = Pin::new(&mut body);
-        let (mut data_len, mut trailers) = (0, None);
-
+    fn next_frame(body: &mut ResponseBody) -> Option<Result<http_body::Frame<Bytes>, Error>> {
+        let mut cx = Context::from_waker(Waker::noop());
         loop {
-            match body.as_mut().poll_frame(&mut cx) {
-                Poll::Ready(Some(frame)) => match frame?.into_data() {
-                    Ok(data) => data_len += data.len(),
-                    Err(frame) => trailers = frame.into_trailers().ok(),
-                },
-                Poll::Ready(None) => return Ok((data_len, trailers)),
-                Poll::Pending => unreachable!("in-memory stream is always ready"),
+            if let Poll::Ready(frame) = Pin::new(&mut *body).poll_frame(&mut cx) {
+                return frame;
             }
         }
     }
 
+    /// Drains the body, returning the data bytes and the trailers.
+    fn drain(mut body: ResponseBody) -> Result<(BytesMut, Option<HeaderMap>), Error> {
+        let (mut data, mut trailers) = (BytesMut::new(), None);
+
+        while let Some(frame) = next_frame(&mut body) {
+            match frame?.into_data() {
+                Ok(bytes) => data.put(bytes),
+                Err(frame) => trailers = frame.into_trailers().ok(),
+            }
+        }
+
+        Ok((data, trailers))
+    }
+
+    fn assert_complete(chunks: Vec<Bytes>, expected_data: &[u8], case: &str) {
+        let (data, trailers) =
+            drain(body_from_chunks(chunks)).unwrap_or_else(|e| panic!("{case}: {e}"));
+
+        assert_eq!(data, expected_data, "{case}");
+        let trailers = trailers.unwrap_or_else(|| panic!("{case}: no trailers"));
+        assert_eq!(trailers.get("grpc-status").unwrap(), "0", "{case}");
+    }
+
     #[test]
     fn trailers_are_returned_wherever_the_chunk_boundary_lands() {
-        let (wire, data_frame_len) = wire(1024);
+        let (wire, data_frames_len) = wire(&[1024], TRAILERS);
 
         for split in 0..=wire.len() {
             let chunks = vec![wire.slice(..split), wire.slice(split..)];
-            let (data_len, trailers) =
-                drain(body_from_chunks(chunks)).unwrap_or_else(|e| panic!("split at {split}: {e}"));
-
-            assert_eq!(data_len, data_frame_len, "split at {split}");
-            let trailers = trailers.unwrap_or_else(|| panic!("split at {split}: no trailers"));
-            assert_eq!(
-                trailers.get("grpc-status").unwrap(),
-                "0",
-                "split at {split}"
+            assert_complete(
+                chunks,
+                &wire[..data_frames_len],
+                &format!("split at {split}"),
             );
         }
     }
 
     #[test]
-    fn stream_ending_inside_the_trailers_frame_is_malformed() {
-        let (wire, data_frame_len) = wire(16);
+    fn trailers_are_returned_when_every_byte_is_its_own_chunk() {
+        let (wire, data_frames_len) = wire(&[300, 0, 7], TRAILERS);
 
-        for end in data_frame_len + 1..wire.len() {
+        let chunks = (0..wire.len()).map(|i| wire.slice(i..i + 1)).collect();
+        assert_complete(chunks, &wire[..data_frames_len], "one byte per chunk");
+    }
+
+    #[test]
+    fn stream_ending_inside_the_trailers_frame_is_malformed() {
+        let (wire, data_frames_len) = wire(&[16], TRAILERS);
+
+        for end in data_frames_len + 1..wire.len() {
             let result = drain(body_from_chunks(vec![wire.slice(..end)]));
             assert!(
                 matches!(result, Err(Error::MalformedResponse)),
                 "truncated at {end}"
             );
         }
+    }
+
+    #[test]
+    fn body_ends_after_a_trailers_frame_that_fails_to_parse() {
+        let (wire, data_frames_len) = wire(&[16], b"not a header\r\n");
+        // More bytes after the trailers frame must not be read as trailers.
+        let mut body = body_from_chunks(vec![wire.clone(), wire.clone()]);
+
+        let mut data = BytesMut::new();
+        let mut errors = 0;
+        while let Some(frame) = next_frame(&mut body) {
+            match frame {
+                Ok(frame) => data.put(frame.into_data().expect("no trailers were parsed")),
+                Err(e) => {
+                    assert!(matches!(e, Error::HeaderParsingError), "{e}");
+                    errors += 1;
+                }
+            }
+        }
+
+        assert_eq!(errors, 1);
+        assert_eq!(data, &wire[..data_frames_len]);
     }
 }
