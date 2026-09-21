@@ -33,19 +33,24 @@ impl EncodedBytes {
         })
     }
 
-    // This is to avoid passing a slice of bytes with a length that the base64
-    // decoder would consider invalid.
+    // Return the largest prefix that can be decoded in one call. Keep incomplete
+    // quartets buffered and stop after the first padded quartet, since gRPC-web
+    // can concatenate independently padded base64 segments.
     #[inline]
     fn max_decodable(&self) -> usize {
-        (self.raw_buf.len() / 4) * 4
+        let complete_quartets = (self.raw_buf.len() / 4) * 4;
+        self.raw_buf[..complete_quartets]
+            .iter()
+            .position(|&byte| byte == b'=')
+            .map_or(complete_quartets, |position| (position / 4 + 1) * 4)
     }
 
     fn decode_base64_chunk(&mut self) -> Result<(), Error> {
-        let index = self.max_decodable();
+        while self.raw_buf.len() >= 4 {
+            let index = self.max_decodable();
 
-        if self.raw_buf.len() >= index {
             let decoded = BASE64_STANDARD
-                .decode(self.buf.split_to(index))
+                .decode(self.raw_buf.split_to(index))
                 .map(Bytes::from)?;
             self.buf.put(decoded);
         }
@@ -332,5 +337,73 @@ impl Default for ResponseBody {
             state: ReadState::Done,
             finished_stream: true,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decodes_base64_response() {
+        let mut buf = EncodedBytes::new("application/grpc-web-text+proto").unwrap();
+
+        buf.append(Bytes::from_static(b"AAAAAAA=")).unwrap();
+
+        assert_eq!(&buf[..], &[0, 0, 0, 0, 0]);
+        assert!(buf.raw_buf.is_empty());
+    }
+
+    #[test]
+    fn buffers_incomplete_base64_quartets() {
+        let mut buf = EncodedBytes::new("application/grpc-web-text+proto").unwrap();
+
+        buf.append(Bytes::from_static(b"YWJjZA=")).unwrap();
+        assert_eq!(&buf[..], b"abc");
+        assert_eq!(&buf.raw_buf[..], b"ZA=");
+
+        // Consuming decoded data must not affect the pending encoded bytes.
+        assert_eq!(&buf.take(3)[..], b"abc");
+        buf.append(Bytes::from_static(b"=")).unwrap();
+        assert_eq!(&buf[..], b"d");
+        assert!(buf.raw_buf.is_empty());
+    }
+
+    #[test]
+    fn decodes_concatenated_base64_segments_at_every_chunk_size() {
+        // Include two-byte padding, one-byte padding, and an unpadded segment.
+        let encoded = b"YQ==YmM=ZGVmZ2hpag==";
+
+        for chunk_size in 1..=encoded.len() {
+            let mut buf = EncodedBytes::new("application/grpc-web-text+proto").unwrap();
+            for chunk in encoded.chunks(chunk_size) {
+                buf.append(Bytes::copy_from_slice(chunk)).unwrap();
+            }
+
+            assert_eq!(&buf[..], b"abcdefghij", "chunk size {chunk_size}");
+            assert!(buf.raw_buf.is_empty());
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_base64() {
+        for encoded in [b"!!!!", b"AA=A", b"A==="] {
+            let mut buf = EncodedBytes::new("application/grpc-web-text+proto").unwrap();
+            assert!(matches!(
+                buf.append(Bytes::copy_from_slice(encoded)),
+                Err(Error::Base64DecodeError(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn binary_response_is_not_base64_decoded() {
+        let mut buf = EncodedBytes::new("application/grpc-web+proto").unwrap();
+        let bytes = Bytes::from_static(b"\x00\x80!!!!");
+
+        buf.append(bytes.clone()).unwrap();
+
+        assert_eq!(&buf[..], &bytes[..]);
+        assert!(buf.raw_buf.is_empty());
     }
 }
