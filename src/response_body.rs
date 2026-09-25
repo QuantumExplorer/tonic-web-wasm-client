@@ -141,6 +141,22 @@ impl ResponseBody {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn from_body_stream(
+        body_stream: BodyStream,
+        content_type: &str,
+    ) -> Result<Self, Error> {
+        Ok(Self {
+            body_stream,
+            buf: EncodedBytes::new(content_type)?,
+            incomplete_data: BytesMut::new(),
+            data: None,
+            trailer: None,
+            state: ReadState::CompressionFlag,
+            finished_stream: false,
+        })
+    }
+
     fn read_stream(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
         if self.finished_stream {
             return Poll::Ready(Ok(()));
