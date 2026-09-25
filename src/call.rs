@@ -19,10 +19,11 @@ pub async fn call(
     push_path(&mut base_url, request.uri());
 
     let headers = prepare_headers(request.headers())?;
+    let grpc_timeout = request.headers().get("grpc-timeout").cloned();
     let body = prepare_body(request).await?;
 
     let request = prepare_request(&base_url, headers, body)?;
-    let (init, abort) = options.request_init()?;
+    let (init, abort) = options.request_init(grpc_timeout.as_ref())?;
     let response = fetch(&request, &init).await?;
 
     let result = Response::builder().status(response.status());
